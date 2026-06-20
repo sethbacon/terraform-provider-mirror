@@ -1,0 +1,135 @@
+name: Terraform provider mirror
+description: >-
+  Configure Terraform or OpenTofu to download providers from a network mirror
+  instead of the public registry, by writing a CLI configuration file and
+  exporting TF_CLI_CONFIG_FILE (and TOFU_CLI_CONFIG_FILE for OpenTofu).
+author: sethbacon
+branding:
+  icon: download-cloud
+  color: purple
+
+inputs:
+  mirror-url:
+    description: HTTPS base URL of the provider network mirror (trailing slash optional).
+    required: true
+  binary:
+    description: Which CLI to configure — "terraform" or "tofu".
+    required: false
+    default: terraform
+  allow-direct-fallback:
+    description: Allow falling back to the origin registry for some providers.
+    required: false
+    default: "false"
+  direct-include-patterns:
+    description: >-
+      Newline-separated provider source patterns that should bypass the mirror
+      and install directly (e.g. "registry.terraform.io/hashicorp/*"). Takes
+      precedence over direct-exclude-patterns. Only used with allow-direct-fallback.
+    required: false
+    default: ""
+  direct-exclude-patterns:
+    description: >-
+      Newline-separated provider source patterns forced through the mirror
+      (everything else may fall back to direct). Only used with
+      allow-direct-fallback, and only when direct-include-patterns is empty.
+    required: false
+    default: ""
+  config-path:
+    description: Where to write the CLI config file. Defaults to $RUNNER_TEMP/.terraformrc.
+    required: false
+    default: ""
+
+outputs:
+  config-file-path:
+    description: Absolute path of the CLI configuration file that was written.
+    value: ${{ steps.mirror.outputs.config-file-path }}
+
+runs:
+  using: composite
+  steps:
+    - id: mirror
+      shell: bash
+      env:
+        MIRROR_URL: ${{ inputs.mirror-url }}
+        BINARY: ${{ inputs.binary }}
+        ALLOW_DIRECT: ${{ inputs.allow-direct-fallback }}
+        INCLUDE_PATTERNS: ${{ inputs.direct-include-patterns }}
+        EXCLUDE_PATTERNS: ${{ inputs.direct-exclude-patterns }}
+        CONFIG_PATH_IN: ${{ inputs.config-path }}
+      run: |
+        set -euo pipefail
+
+        # --- validate the mirror URL (HTTPS only, mirroring the ADO task) ---
+        case "$MIRROR_URL" in
+          https://*) : ;;
+          "") echo "::error::mirror-url is required"; exit 1 ;;
+          *) echo "::error::Insecure URL rejected: $MIRROR_URL. Only HTTPS URLs are allowed."; exit 1 ;;
+        esac
+
+        case "$BINARY" in
+          terraform|tofu) : ;;
+          *) echo "::error::binary must be 'terraform' or 'tofu' (got '$BINARY')"; exit 1 ;;
+        esac
+
+        # Normalize: strip trailing slashes, then re-add exactly one (the network
+        # mirror protocol requires a trailing slash).
+        mirror="${MIRROR_URL%/}"
+
+        # --- format a newline-separated input into "a", "b", "c" ---
+        format_list() {
+          local out=""
+          while IFS= read -r line; do
+            line="$(echo "$line" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+            [ -z "$line" ] && continue
+            if [ -z "$out" ]; then out="\"$line\""; else out="$out, \"$line\""; fi
+          done <<< "$1"
+          printf '%s' "$out"
+        }
+
+        # --- build the HCL ---
+        config="provider_installation {
+          network_mirror {
+            url = \"${mirror}/\"
+          }"
+
+        if [ "$ALLOW_DIRECT" = "true" ]; then
+          include="$(format_list "$INCLUDE_PATTERNS")"
+          exclude="$(format_list "$EXCLUDE_PATTERNS")"
+          if [ -n "$include" ]; then
+            config="$config
+          direct {
+            include = [${include}]
+          }"
+          elif [ -n "$exclude" ]; then
+            config="$config
+          direct {
+            exclude = [${exclude}]
+          }"
+          else
+            config="$config
+          direct {}"
+          fi
+        fi
+        config="$config
+        }"
+
+        # --- choose a destination and write it ---
+        dest="$CONFIG_PATH_IN"
+        if [ -z "$dest" ]; then
+          dest="${RUNNER_TEMP:-/tmp}/.terraformrc"
+        fi
+        printf '%s\n' "$config" > "$dest"
+
+        echo "Wrote provider mirror configuration to $dest:"
+        echo "-------------------------------"
+        cat "$dest"
+        echo "-------------------------------"
+
+        # Both terraform and tofu honor TF_CLI_CONFIG_FILE; tofu also reads
+        # TOFU_CLI_CONFIG_FILE, which we set as well so an explicit OpenTofu
+        # config (if any) does not silently win.
+        echo "TF_CLI_CONFIG_FILE=$dest" >> "$GITHUB_ENV"
+        if [ "$BINARY" = "tofu" ]; then
+          echo "TOFU_CLI_CONFIG_FILE=$dest" >> "$GITHUB_ENV"
+        fi
+        echo "config-file-path=$dest" >> "$GITHUB_OUTPUT"
