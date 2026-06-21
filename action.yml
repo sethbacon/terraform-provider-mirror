@@ -1,8 +1,5 @@
 name: Terraform provider mirror
-description: >-
-  Configure Terraform or OpenTofu to download providers from a network mirror
-  instead of the public registry, by writing a CLI configuration file and
-  exporting TF_CLI_CONFIG_FILE (and TOFU_CLI_CONFIG_FILE for OpenTofu).
+description: Configure Terraform or OpenTofu to use a provider network mirror; writes the CLI config and exports TF_CLI_CONFIG_FILE.
 author: sethbacon
 branding:
   icon: download-cloud
