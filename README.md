@@ -1,5 +1,8 @@
 # provider-mirror
 
+[![GitHub release](https://img.shields.io/github/v/release/sethbacon/terraform-provider-mirror?logo=github&label=Marketplace&color=2ea44f)](https://github.com/marketplace/actions/terraform-provider-mirror)
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
+
 Configure Terraform or OpenTofu to pull providers from a **network mirror**
 instead of the public registry. Writes a CLI config file and exports
 `TF_CLI_CONFIG_FILE` (and `TOFU_CLI_CONFIG_FILE` for OpenTofu) for subsequent
