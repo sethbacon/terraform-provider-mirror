@@ -14,9 +14,9 @@ steps.
 |-------|---------|-------|
 | `mirror-url` | — (required) | HTTPS base URL of the network mirror |
 | `binary` | `terraform` | `terraform` or `tofu` (controls which CLI-config env vars are exported) |
-| `allow-direct-fallback` | `false` | permit falling back to the origin registry |
-| `direct-include-patterns` | `""` | newline-separated source patterns that bypass the mirror (takes precedence over exclude) |
-| `direct-exclude-patterns` | `""` | newline-separated source patterns forced through the mirror |
+| `allow-direct-fallback` | `false` | add a `direct` installation method alongside the mirror — **not** a conditional fallback, see below |
+| `direct-include-patterns` | `""` | newline-separated source patterns the `direct` method is limited to |
+| `direct-exclude-patterns` | `""` | newline-separated source patterns the `direct` method must not handle |
 | `config-path` | `$RUNNER_TEMP/.terraformrc` | where to write the config |
 
 ## Outputs
@@ -53,7 +53,7 @@ during `plan` and `apply`.
 For supply-chain-sensitive workflows, pin the full commit SHA instead:
 
 ```yaml
-- uses: sethbacon/terraform-provider-mirror@<full-40-char-sha> # v1.0.0
+- uses: sethbacon/terraform-provider-mirror@02563b8dd312f42c5f5b539449ef1b071a766d37 # v1.0.0
   with:
     mirror-url: https://registry.internal.example.com/providers
 ```
@@ -73,3 +73,30 @@ with:
 ```bash
 gh attestation verify --owner sethbacon --repo terraform-provider-mirror action.yml
 ```
+## How Terraform actually chooses an installation method
+
+This matters because the obvious reading of "fallback" is wrong, and the
+difference decides whether your providers come from the mirror at all.
+
+Terraform does **not** try the mirror first and fall back when it misses. It
+[queries *every* installation method whose `include`/`exclude` patterns match a
+provider, and installs the newest version any of them
+offers](https://developer.hashicorp.com/terraform/cli/config/config-file#provider-installation).
+
+Two consequences:
+
+- **`allow-direct-fallback: "true"` with both pattern inputs empty re-enables
+  direct installation for every provider, not just missing ones.** A bare
+  `direct {}` block matches everything, and the generated `network_mirror` block
+  has no patterns either, so whenever the public registry has a newer version
+  than your mirror, Terraform takes the registry's — EVERY provider may be
+  installed from the origin registry, not just ones the mirror is missing. If your reason for running a
+  mirror is pinning, auditing or air-gap rehearsal, that silently defeats it.
+  Scope the `direct` method with `direct-include-patterns` whenever you enable
+  it.
+- **When both `include` and `exclude` are set on one method, `exclude` wins.**
+  This action never emits both on the same block — `direct-include-patterns`
+  takes priority and `direct-exclude-patterns` is used only when include is
+  empty — so the generated config is unambiguous. Earlier revisions of this
+  README described include as "taking precedence over exclude" as though it were
+  a Terraform rule; it is not, it is a property of what this action generates.
