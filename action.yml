@@ -7,34 +7,59 @@ branding:
 
 inputs:
   mirror-url:
-    description: HTTPS base URL of the provider network mirror (trailing slash optional).
+    description: >-
+      HTTPS base URL of the provider network mirror (trailing slash optional).
+      Must be https://host[:port][/path]. Embedded credentials (user:pass@),
+      query strings, fragments and characters that cannot appear in a URL are
+      rejected — the value is written into an HCL string, so it is validated
+      rather than escaped.
     required: true
   binary:
     description: Which CLI to configure — "terraform" or "tofu".
     required: false
     default: terraform
   allow-direct-fallback:
-    description: Allow falling back to the origin registry for some providers.
+    description: >-
+      Add a "direct" installation method alongside the network mirror. This is
+      not a conditional fallback: Terraform queries every installation method
+      whose patterns match a provider and installs the newest version any of
+      them offers. With both pattern inputs empty, EVERY provider may therefore
+      be installed from the origin registry whenever the registry has a newer
+      version than the mirror.
     required: false
     default: "false"
   direct-include-patterns:
     description: >-
-      Newline-separated provider source patterns that should bypass the mirror
-      and install directly (e.g. "registry.terraform.io/hashicorp/*"). Takes
-      precedence over direct-exclude-patterns. Only used with allow-direct-fallback.
+      Newline-separated provider source patterns the direct method is limited to
+      (e.g. "registry.terraform.io/hashicorp/*"). Only used with
+      allow-direct-fallback. When this is non-empty the action emits an include
+      list and ignores direct-exclude-patterns; Terraform's own rule is that
+      exclude wins when one method sets both, so this action never emits both.
+      Allowed characters: letters, digits and . _ - / *
     required: false
     default: ""
   direct-exclude-patterns:
     description: >-
-      Newline-separated provider source patterns forced through the mirror
-      (everything else may fall back to direct). Only used with
+      Newline-separated provider source patterns the direct method must not
+      serve, forcing those providers to come from the mirror. Only used with
       allow-direct-fallback, and only when direct-include-patterns is empty.
+      Allowed characters: letters, digits and . _ - / *
     required: false
     default: ""
   config-path:
-    description: Where to write the CLI config file. Defaults to $RUNNER_TEMP/.terraformrc.
+    description: >-
+      Where to write the CLI config file. Must be inside RUNNER_TEMP or
+      GITHUB_WORKSPACE and named like a CLI config file (.terraformrc,
+      terraform.rc, .tofurc, tofu.rc, *.tfrc, *.terraformrc); any existing file
+      at that path is overwritten. Defaults to $RUNNER_TEMP/.terraformrc.
     required: false
     default: ""
+  log-config:
+    description: >-
+      Print the generated configuration to the step log. Off by default so that
+      a mirror URL is not copied into a build log that may be world-readable.
+    required: false
+    default: "false"
 
 outputs:
   config-file-path:
@@ -46,6 +71,9 @@ runs:
   steps:
     - id: mirror
       shell: bash
+      # Inputs arrive through env: only. A ${{ }} expression inside the run body
+      # would be substituted into the script text before bash parses it, which
+      # turns any input into shell source. tests/run-tests.sh asserts this.
       env:
         MIRROR_URL: ${{ inputs.mirror-url }}
         BINARY: ${{ inputs.binary }}
@@ -53,35 +81,237 @@ runs:
         INCLUDE_PATTERNS: ${{ inputs.direct-include-patterns }}
         EXCLUDE_PATTERNS: ${{ inputs.direct-exclude-patterns }}
         CONFIG_PATH_IN: ${{ inputs.config-path }}
+        LOG_CONFIG: ${{ inputs.log-config }}
       run: |
         set -euo pipefail
 
-        # --- validate the mirror URL (HTTPS only, mirroring the ADO task) ---
-        case "$MIRROR_URL" in
-          https://*) : ;;
-          "") echo "::error::mirror-url is required"; exit 1 ;;
-          *) echo "::error::Insecure URL rejected: $MIRROR_URL. Only HTTPS URLs are allowed."; exit 1 ;;
-        esac
+        # Guards are tagged `# GUARD:<name>`; tests/mutations.sh disables each one
+        # in turn and requires the rows it owns in tests/run-tests.sh to fail.
 
-        case "$BINARY" in
-          terraform|tofu) : ;;
-          *) echo "::error::binary must be 'terraform' or 'tofu' (got '$BINARY')"; exit 1 ;;
-        esac
+        # ------------------------------------------------------------ helpers --
+        # No untrusted value ever reaches a printf format string, and every value
+        # echoed back has its control characters removed first, so an input cannot
+        # forge a ::workflow command:: line of its own.
+        scrub() { printf '%s' "${1-}" | tr -d '\000-\037\177'; }
+
+        fail() { printf '::error::%s\n' "$1"; exit 1; }
+
+        require_choice() { # <input name> <value> <allowed>...
+          local name="$1" value="$2" allowed
+          shift 2
+          for allowed in "$@"; do
+            if [ "$value" = "$allowed" ]; then return 0; fi
+          done
+          fail "$name must be one of: $* (got '$(scrub "$value")')"
+        }
+
+        # --- secret hygiene -----------------------------------------------------
+        # mirror-url is the only input that plausibly carries a credential (the
+        # action has no token input). Anything credential-shaped is masked before
+        # the value is validated, so a URL that is rejected for carrying a secret
+        # does not leak that secret here or in any later step of the job. Masking
+        # runs before the character guard, so only values that are already free of
+        # control characters are emitted — otherwise the mask line itself could be
+        # used to forge a workflow command.
+        mask_secret() { # <value>
+          local re='^[[:print:]][[:print:]][[:print:]]+$'
+          if [[ "$1" =~ $re ]]; then printf '::add-mask::%s\n' "$1"; fi
+        }
+
+        mask_url_secrets() { # <url>
+          local rest authority userinfo query pair key
+          rest="${1#*://}"
+          authority="${rest%%/*}"
+          authority="${authority%%\?*}"
+          authority="${authority%%#*}"
+          case "$authority" in
+            *@*)
+              userinfo="${authority%@*}"
+              mask_secret "$userinfo"
+              case "$userinfo" in *:*) mask_secret "${userinfo#*:}" ;; esac
+              ;;
+          esac
+          case "$1" in
+            *\?*)
+              query="${1#*\?}"
+              query="${query%%#*}"
+              while [ -n "$query" ]; do
+                pair="${query%%&*}"
+                key="$(printf '%s' "${pair%%=*}" | tr '[:upper:]' '[:lower:]')"
+                case "$key" in
+                  token|tok|sig|signature|key|secret|password|passwd|pass|apikey|api_key|access_token|sas|code)
+                    mask_secret "${pair#*=}"
+                    ;;
+                esac
+                if [ "$pair" = "$query" ]; then break; fi
+                query="${query#*&}"
+              done
+              ;;
+          esac
+        }
+
+        # --- mirror URL ---------------------------------------------------------
+        # The URL is interpolated into an HCL double-quoted string, so the
+        # character set is an allow-list rather than an escape: a value carrying a
+        # quote could close that string and append a second network_mirror block,
+        # and a value carrying a newline could forge a log line.
+        # Every allow-list below is matched with LC_ALL=C in scope. bash evaluates a
+        # bracket RANGE by the active locale's collation, and under en_US.UTF-8 —
+        # the default on GitHub-hosted runners — [A-Za-z] collates accented letters
+        # INSIDE the range, so `https://exämple.com/` satisfied a guard whose
+        # message says non-ASCII is rejected. Byte-wise matching is the property
+        # these allow-lists are relying on, so it has to be asserted, not assumed.
+        URL_CHARSET_RE='^[A-Za-z0-9._~:/@!&()*+,;=%-]+$'
+        MIRROR_HOST_RE='^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?(:[0-9][0-9]*)?$'
+
+        require_url_charset() { # <input name> <value>
+          local LC_ALL=C
+          if ! [[ "$2" =~ $URL_CHARSET_RE ]]; then
+            fail "$1 contains characters that cannot appear in a mirror URL. Allowed: letters, digits and ._~:/@!&()*+,;=%- — whitespace, control characters, quotes, backslashes, '?', '#', '{', '}' and non-ASCII are rejected. The value is not echoed back because it may contain a forged log line."
+          fi
+        }
+
+        require_https_authority() { # <input name> <value>
+          local name="$1" url="$2" authority
+          case "$url" in
+            https://*) : ;;
+            *) fail "$name must start with https:// — only HTTPS mirrors are allowed." ;;
+          esac
+          authority="${url#https://}"
+          authority="${authority%%/*}"
+          authority="${authority%%\?*}"
+          authority="${authority%%#*}"
+          if [ -z "$authority" ]; then
+            fail "$name has no host: expected https://host[:port][/path]."
+          fi
+          case "$authority" in
+            *@*) fail "$name must not embed credentials (user:password@host). Give the mirror's credentials to Terraform with a credentials block or a .netrc file instead." ;;
+          esac
+          local LC_ALL=C
+          if ! [[ "$authority" =~ $MIRROR_HOST_RE ]]; then
+            fail "$name has an invalid host '$(scrub "$authority")': expected a DNS name or IPv4 address with an optional :port."
+          fi
+        }
+
+        # --- provider source patterns -------------------------------------------
+        # Each pattern is emitted as an HCL string element, so the same reasoning
+        # as for the URL applies: allow-list the characters a provider source
+        # address can contain and reject everything else.
+        PATTERN_RE='^[A-Za-z0-9._*/-]+$'
+
+        require_pattern() { # <input name> <line>
+          local LC_ALL=C
+          if ! [[ "$2" =~ $PATTERN_RE ]]; then
+            fail "$1 entry '$(scrub "$2")' is not a valid provider source pattern. Allowed characters: letters, digits and . _ - / *"
+          fi
+        }
+
+        FORMATTED=""
+        format_list() { # <input name> <newline-separated value> -> FORMATTED
+          local name="$1" raw="$2" line out=""
+          while IFS= read -r line; do
+            line="${line#"${line%%[![:space:]]*}"}"
+            line="${line%"${line##*[![:space:]]}"}"
+            if [ -z "$line" ]; then continue; fi
+            require_pattern "$name" "$line" # GUARD:pattern-allowlist
+            if [ -z "$out" ]; then out="\"$line\""; else out="$out, \"$line\""; fi
+          done <<< "$raw"
+          FORMATTED="$out"
+        }
+
+        # --- destination path ---------------------------------------------------
+        # A newline in the destination would forge a second KEY=VALUE line in
+        # $GITHUB_ENV, exported to every later step of the caller's job.
+        CONFIG_PATH_RE='^[A-Za-z0-9 ._/:+@=,-]+$'
+
+        require_path_charset() { # <input name> <value>
+          local LC_ALL=C
+          if ! [[ "$2" =~ $CONFIG_PATH_RE ]]; then
+            fail "$1 contains characters that are not allowed in a path. Allowed: letters, digits, space and ._/:+@=,- — newlines, carriage returns, control characters, quotes, backslashes and glob characters are rejected."
+          fi
+        }
+
+        require_not_symlink() { # <input name> <path>
+          if [ -L "$2" ]; then
+            fail "$1 '$(scrub "$2")' is a symlink. Refusing to write through it."
+          fi
+        }
+
+        canonicalize() { # <path> -> absolute, normalised path on stdout
+          local -              # restore shell options on return
+          set -f               # the fallback below expands $p unquoted
+          local p="$1" resolved seg acc=""
+          case "$p" in /*) : ;; *) p="$PWD/$p" ;; esac
+          if resolved="$(realpath -m -- "$p" 2>/dev/null)" && [ -n "$resolved" ]; then
+            printf '%s' "$resolved"
+            return 0
+          fi
+          local IFS=/
+          for seg in $p; do
+            case "$seg" in
+              ""|.) : ;;
+              ..) acc="${acc%/*}" ;;
+              *) acc="$acc/$seg" ;;
+            esac
+          done
+          printf '%s' "${acc:-/}"
+        }
+
+        require_within_roots() { # <path> <root>...
+          local path="$1" root
+          shift
+          for root in "$@"; do
+            if [ -z "$root" ]; then continue; fi
+            if [ "$path" = "$root" ] || [ "${path#"$root"/}" != "$path" ]; then return 0; fi
+          done
+          fail "config-path '$(scrub "$1")' is outside the directories this action may write to (RUNNER_TEMP and GITHUB_WORKSPACE). Pick a path inside one of them."
+        }
+
+        require_config_filename() { # <path>
+          local base="${1##*/}"
+          case "$base" in
+            .terraformrc|terraform.rc|.tofurc|tofu.rc|*.terraformrc|*.tfrc|*.tofurc) return 0 ;;
+          esac
+          fail "config-path must name a CLI configuration file (.terraformrc, terraform.rc, .tofurc, tofu.rc, *.tfrc or *.terraformrc); got '$(scrub "$base")'."
+        }
+
+        require_regular_file() { # <path>
+          if [ -e "$1" ] && [ ! -f "$1" ]; then
+            fail "config-path '$(scrub "$1")' exists and is not a regular file. Refusing to write over it."
+          fi
+        }
+
+        # --- runner file commands -----------------------------------------------
+        # The heredoc form is what makes a value that contains a newline a single
+        # (malformed) entry instead of a second forged KEY=VALUE line. The
+        # delimiter is random so no value can close the block early.
+        rand_delim() {
+          local d=""
+          if [ -r /dev/urandom ]; then d="$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"; fi
+          if [ -z "$d" ]; then d="$RANDOM$RANDOM$RANDOM$RANDOM$RANDOM"; fi
+          printf 'ghadelim_%s' "$d"
+        }
+
+        emit_kv() { # <file> <key> <value>
+          local delim
+          delim="$(rand_delim)"
+          printf '%s<<%s\n%s\n%s\n' "$2" "$delim" "$3" "$delim" >> "$1" # GUARD:env-heredoc
+        }
+
+        # =================================================================== run =
+        if [ -z "$MIRROR_URL" ]; then fail "mirror-url is required"; fi # GUARD:mirror-url-required
+        mask_url_secrets "$MIRROR_URL" # GUARD:mirror-url-mask
+        require_url_charset mirror-url "$MIRROR_URL" # GUARD:mirror-url-charset
+        require_https_authority mirror-url "$MIRROR_URL" # GUARD:mirror-url-authority
+
+        require_choice binary "$BINARY" terraform tofu # GUARD:binary
+        require_choice allow-direct-fallback "$ALLOW_DIRECT" true false # GUARD:bool-allow-direct
+        require_choice log-config "$LOG_CONFIG" true false # GUARD:bool-log-config
 
         # Normalize: strip trailing slashes, then re-add exactly one (the network
         # mirror protocol requires a trailing slash).
-        mirror="${MIRROR_URL%/}"
-
-        # --- format a newline-separated input into "a", "b", "c" ---
-        format_list() {
-          local out=""
-          while IFS= read -r line; do
-            line="$(echo "$line" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
-            [ -z "$line" ] && continue
-            if [ -z "$out" ]; then out="\"$line\""; else out="$out, \"$line\""; fi
-          done <<< "$1"
-          printf '%s' "$out"
-        }
+        mirror="$MIRROR_URL"
+        while [ "${mirror%/}" != "$mirror" ]; do mirror="${mirror%/}"; done
 
         # --- build the HCL ---
         config="provider_installation {
@@ -89,9 +319,16 @@ runs:
             url = \"${mirror}/\"
           }"
 
+        # Patterns are validated whether or not they are used, so a malformed
+        # pattern is reported rather than silently ignored.
+        format_list direct-include-patterns "$INCLUDE_PATTERNS"
+        include="$FORMATTED"
+        format_list direct-exclude-patterns "$EXCLUDE_PATTERNS"
+        exclude="$FORMATTED"
+
         if [ "$ALLOW_DIRECT" = "true" ]; then
-          include="$(format_list "$INCLUDE_PATTERNS")"
-          exclude="$(format_list "$EXCLUDE_PATTERNS")"
+          # Terraform gives exclude priority when one method sets both, so only
+          # one of the two lists is ever emitted.
           if [ -n "$include" ]; then
             config="$config
           direct {
@@ -111,22 +348,34 @@ runs:
         }"
 
         # --- choose a destination and write it ---
+        TMP_ROOT="$(canonicalize "${RUNNER_TEMP:-/tmp}")"
+        WS_ROOT=""
+        if [ -n "${GITHUB_WORKSPACE:-}" ]; then WS_ROOT="$(canonicalize "$GITHUB_WORKSPACE")"; fi
+
         dest="$CONFIG_PATH_IN"
-        if [ -z "$dest" ]; then
-          dest="${RUNNER_TEMP:-/tmp}/.terraformrc"
-        fi
+        if [ -z "$dest" ]; then dest="$TMP_ROOT/.terraformrc"; fi
+        require_path_charset config-path "$dest" # GUARD:config-path-charset
+        require_not_symlink config-path "$dest" # GUARD:config-path-symlink
+        dest="$(canonicalize "$dest")" # GUARD:config-path-canonical
+        require_within_roots "$dest" "$TMP_ROOT" "$WS_ROOT" # GUARD:config-path-containment
+        require_config_filename "$dest" # GUARD:config-path-filename
+        require_regular_file "$dest" # GUARD:config-path-regular
+
+        mkdir -p "$(dirname "$dest")"
         printf '%s\n' "$config" > "$dest"
 
-        echo "Wrote provider mirror configuration to $dest:"
-        echo "-------------------------------"
-        cat "$dest"
-        echo "-------------------------------"
+        printf 'Wrote the %s provider mirror configuration to %s\n' "$BINARY" "$dest"
+        if [ "$LOG_CONFIG" = "true" ]; then
+          printf -- '-------------------------------\n'
+          cat "$dest"
+          printf -- '-------------------------------\n'
+        fi
 
         # Both terraform and tofu honor TF_CLI_CONFIG_FILE; tofu also reads
         # TOFU_CLI_CONFIG_FILE, which we set as well so an explicit OpenTofu
         # config (if any) does not silently win.
-        echo "TF_CLI_CONFIG_FILE=$dest" >> "$GITHUB_ENV"
+        emit_kv "$GITHUB_ENV" TF_CLI_CONFIG_FILE "$dest"
         if [ "$BINARY" = "tofu" ]; then
-          echo "TOFU_CLI_CONFIG_FILE=$dest" >> "$GITHUB_ENV"
+          emit_kv "$GITHUB_ENV" TOFU_CLI_CONFIG_FILE "$dest"
         fi
-        echo "config-file-path=$dest" >> "$GITHUB_OUTPUT"
+        emit_kv "$GITHUB_OUTPUT" config-file-path "$dest"
