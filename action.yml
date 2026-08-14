@@ -1,5 +1,5 @@
 name: Terraform provider mirror
-description: Configure Terraform or OpenTofu to use a provider network mirror; writes the CLI config and exports TF_CLI_CONFIG_FILE.
+description: Configure Terraform/OpenTofu for a provider network mirror; exports TF_/TOFU_CLI_CONFIG_FILE and outputs the config path.
 author: sethbacon
 branding:
   icon: download-cloud
@@ -197,6 +197,13 @@ runs:
         # Each pattern is emitted as an HCL string element, so the same reasoning
         # as for the URL applies: allow-list the characters a provider source
         # address can contain and reject everything else.
+        # One definition of "this value, inside an HCL double-quoted string", so a
+        # field added later has an established primitive to reach for instead of
+        # becoming a third independently-written interpolation site. Quoting is
+        # all it does: every value that reaches it has already passed a character
+        # allow-list, which is what makes escaping unnecessary here.
+        hcl_string() { printf '"%s"' "$1"; }
+
         PATTERN_RE='^[A-Za-z0-9._*/-]+$'
 
         require_pattern() { # <input name> <line>
@@ -214,7 +221,7 @@ runs:
             line="${line%"${line##*[![:space:]]}"}"
             if [ -z "$line" ]; then continue; fi
             require_pattern "$name" "$line" # GUARD:pattern-allowlist
-            if [ -z "$out" ]; then out="\"$line\""; else out="$out, \"$line\""; fi
+            if [ -z "$out" ]; then out="$(hcl_string "$line")"; else out="$out, $(hcl_string "$line")"; fi
           done <<< "$raw"
           FORMATTED="$out"
         }
@@ -300,6 +307,12 @@ runs:
 
         # =================================================================== run =
         if [ -z "$MIRROR_URL" ]; then fail "mirror-url is required"; fi # GUARD:mirror-url-required
+        # RFC 3986 §3.1: the scheme is case-insensitive, so HTTPS:// names the
+        # same secure scheme. Matching only the lowercase literal rejected it and
+        # called it insecure, which sends a consumer looking for the wrong
+        # problem entirely. Only the scheme is lowercased — the path is
+        # case-sensitive and the value is written into the config verbatim.
+        if [[ "$MIRROR_URL" =~ ^[Hh][Tt][Tt][Pp][Ss]:// ]]; then MIRROR_URL="https://${MIRROR_URL#*://}"; fi # GUARD:scheme-case
         mask_url_secrets "$MIRROR_URL" # GUARD:mirror-url-mask
         require_url_charset mirror-url "$MIRROR_URL" # GUARD:mirror-url-charset
         require_https_authority mirror-url "$MIRROR_URL" # GUARD:mirror-url-authority
@@ -316,7 +329,7 @@ runs:
         # --- build the HCL ---
         config="provider_installation {
           network_mirror {
-            url = \"${mirror}/\"
+            url = $(hcl_string "${mirror}/")
           }"
 
         # Patterns are validated whether or not they are used, so a malformed
@@ -361,8 +374,18 @@ runs:
         require_config_filename "$dest" # GUARD:config-path-filename
         require_regular_file "$dest" # GUARD:config-path-regular
 
-        mkdir -p "$(dirname "$dest")"
-        printf '%s\n' "$config" > "$dest"
+        # Every other failure here is an ::error:: annotation naming the input that
+        # caused it; an unwritable destination used to be the one that came out as
+        # a raw interpreter message with no mention of config-path.
+        mkdir -p "$(dirname "$dest")" ||
+          fail "could not create the directory for config-path '$(scrub "$dest")'." # GUARD:write-diagnostic
+        printf '%s\n' "$config" > "$dest" ||
+          fail "could not write the CLI configuration to config-path '$(scrub "$dest")'." # GUARD:write-diagnostic
+        # A composite action has no post step, so this file stays for the rest of
+        # the job at a path a later step may cache or upload. It is only ever read
+        # by the CLI running as this user in this job, so it does not need to
+        # inherit whatever the runner's umask happens to be.
+        chmod 600 "$dest" # GUARD:config-file-mode
 
         printf 'Wrote the %s provider mirror configuration to %s\n' "$BINARY" "$dest"
         if [ "$LOG_CONFIG" = "true" ]; then
@@ -374,6 +397,15 @@ runs:
         # Both terraform and tofu honor TF_CLI_CONFIG_FILE; tofu also reads
         # TOFU_CLI_CONFIG_FILE, which we set as well so an explicit OpenTofu
         # config (if any) does not silently win.
+        #
+        # This is a $GITHUB_ENV write, so it applies to EVERY later step in the
+        # caller's job and a composite action has no post step to revert it. If
+        # the caller had already pointed the CLI somewhere else, that is being
+        # replaced — silently, until now.
+        if [ -n "${TF_CLI_CONFIG_FILE:-}" ] && [ "${TF_CLI_CONFIG_FILE}" != "$dest" ]; then
+          printf '::warning::TF_CLI_CONFIG_FILE was already set to %s and is replaced for the rest of this job; a composite action has no post step to restore it.\n' \
+            "$(scrub "$TF_CLI_CONFIG_FILE")" # GUARD:env-overwrite-warning
+        fi
         emit_kv "$GITHUB_ENV" TF_CLI_CONFIG_FILE "$dest"
         if [ "$BINARY" = "tofu" ]; then
           emit_kv "$GITHUB_ENV" TOFU_CLI_CONFIG_FILE "$dest"

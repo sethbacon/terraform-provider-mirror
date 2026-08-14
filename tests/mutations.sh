@@ -43,6 +43,10 @@ LINE_GUARDS=(
   config-path-containment
   config-path-filename
   config-path-regular
+  scheme-case
+  config-file-mode
+  env-overwrite-warning
+  write-diagnostic
 )
 
 mutate_line_guard() { # <guard-name> <src> <dst>
@@ -76,6 +80,35 @@ mutate_special() { # <guard-name> <src> <dst>
 
 SPECIAL_GUARDS=(env-heredoc config-path-canonical charset-locale)
 
+# The charset-locale guard defends a hazard that only EXISTS in a collating
+# locale. bash evaluates an ERE bracket RANGE by LC_COLLATE, so `[A-Za-z]`
+# admits `ä` under en_US.UTF-8 and refuses it under C and C.UTF-8 — verified in
+# all three. GitHub-hosted runners default to C.UTF-8, so running this mutation
+# in the ambient locale reports the guard INERT and would argue for deleting a
+# guard that is load bearing on every runner where the hazard is real (a
+# self-hosted host or a container with a collating LANG, which is the
+# configuration the guard's own comment names). Find a locale that reproduces
+# the hazard, and refuse to report a verdict if the host has none.
+collating_locale() {
+  local loc
+  for loc in en_US.UTF-8 en_US.utf8 en_GB.UTF-8 $(locale -a 2>/dev/null | grep -iE 'utf-?8$'); do
+    if LC_ALL="$loc" bash -c 're="^[A-Za-z0-9.]+$"; [[ "exämple.com" =~ $re ]]' 2>/dev/null; then
+      printf '%s' "$loc"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Prints the locale a guard's mutation must run under (empty for most of them).
+# Non-zero means a REQUIRED locale is unavailable on this host.
+locale_for() { # <guard-name>
+  case "$1" in
+    charset-locale) collating_locale ;;
+    *) printf '' ;;
+  esac
+}
+
 run_one() { # <guard-name>
   local g="$1" mutant="$T/action-$1.yml" out="$T/out-$1"
   if printf '%s\n' "${SPECIAL_GUARDS[@]}" | grep -qx "$g"; then
@@ -93,8 +126,17 @@ run_one() { # <guard-name>
     return 1
   fi
 
+  local loc
+  if ! loc="$(locale_for "$g")"; then
+    printf 'NOLOC  %-26s no collating UTF-8 locale on this host, so the hazard this guard defends cannot be reproduced. Generate one (locale-gen en_US.UTF-8) rather than trusting this run.\n' "$g"
+    return 1
+  fi
+  if [ -n "$loc" ]; then
+    printf '       %-26s reproducing the hazard under LC_ALL=%s\n' "$g" "$loc"
+  fi
+
   set +e
-  ACTION_YML="$mutant" "$REPO_ROOT/tests/run-tests.sh" >"$out" 2>&1
+  env ${loc:+LC_ALL="$loc"} ACTION_YML="$mutant" "$REPO_ROOT/tests/run-tests.sh" >"$out" 2>&1
   set -e
 
   local failed
