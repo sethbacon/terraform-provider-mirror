@@ -535,6 +535,58 @@ else
 fi
 
 # ================================================================== manifest ==
+note "mirror-url: scheme case"
+
+# RFC 3986 §3.1 makes the scheme case-insensitive. Matching only the lowercase
+# literal rejected a valid HTTPS URL AND told the author it was insecure.
+run_action MIRROR_URL='HTTPS://mirror.example.com/tf/'
+expect_ok "mirror-url scheme case: HTTPS:// is accepted" 'Wrote the terraform'
+expect_config "mirror-url scheme case: the emitted scheme is normalised to lowercase" \
+  "$(CFG)" 'https://mirror.example.com/tf/'
+
+run_action MIRROR_URL='HTTP://mirror.example.com/tf/'
+expect_fail "mirror-url scheme case: HTTP:// is still rejected" \
+  '::error::mirror-url must start with https://'
+
+note "written file"
+
+# A composite action has no post step, so this file stays for the rest of the
+# job at a path a later step may cache or upload as an artifact.
+run_action
+if [ "$STATUS" -eq 0 ]; then
+  mode="$(stat -c '%a' "$(CFG)" 2>/dev/null || stat -f '%Lp' "$(CFG)")"
+  if [ "$mode" = "600" ]; then
+    pass "written file: the configuration is not readable by group or other"
+  else
+    fail "written file: the configuration is not readable by group or other" "mode is $mode"
+  fi
+else
+  fail "written file: the configuration is not readable by group or other" "$(tail3)"
+fi
+
+# An unwritable destination used to surface as a raw interpreter message with no
+# mention of config-path, unlike every other failure in this script.
+new_rt
+mkdir -p "$RT/tmp/locked"
+chmod 500 "$RT/tmp/locked"
+run_action CONFIG_PATH_IN="$RT/tmp/locked/.terraformrc"
+chmod 700 "$LAST/tmp/locked"
+expect_fail "written file: an unwritable destination is diagnosed as a config-path failure" \
+  '::error::could not write the CLI configuration to config-path'
+
+# The $GITHUB_ENV write applies to every later step in the caller's job and
+# cannot be reverted, so replacing a value the caller already set is said out loud.
+run_action TF_CLI_CONFIG_FILE=/home/runner/.terraformrc
+expect_ok "written file: replacing an existing TF_CLI_CONFIG_FILE is announced" \
+  '::warning::TF_CLI_CONFIG_FILE was already set to /home/runner/\.terraformrc and is replaced'
+
+run_action
+if printf '%s\n' "$OUT" | grep -q '::warning::TF_CLI_CONFIG_FILE was already set'; then
+  fail "written file: no overwrite warning when nothing was set" "$(tail3)"
+else
+  pass "written file: no overwrite warning when nothing was set"
+fi
+
 note "manifest, workflows and docs"
 
 # A composite action's ${{ }} expressions are substituted into the script text

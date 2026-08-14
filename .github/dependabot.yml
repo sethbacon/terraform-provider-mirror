@@ -1,0 +1,16 @@
+---
+version: 2
+
+updates:
+  # The third-party actions in pr-checks.yml are correctly SHA-pinned, but a pin
+  # is a snapshot that only stays safe if something moves it forward. Without
+  # this there is no signal when a pinned commit falls behind an upstream
+  # security fix. Dependabot rewrites the SHA and keeps the trailing `# vX.Y.Z`
+  # comment in sync — which is also what the workflow-pinning assertion in
+  # tests/run-tests.sh checks.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: ci(deps)

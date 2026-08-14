@@ -17,7 +17,8 @@ steps.
 | `allow-direct-fallback` | `false` | add a `direct` installation method alongside the mirror — **not** a conditional fallback, see below |
 | `direct-include-patterns` | `""` | newline-separated source patterns the `direct` method is limited to |
 | `direct-exclude-patterns` | `""` | newline-separated source patterns the `direct` method must not handle |
-| `config-path` | `$RUNNER_TEMP/.terraformrc` | where to write the config |
+| `config-path` | `$RUNNER_TEMP/.terraformrc` | where to write the config — **any existing file there is overwritten without warning** |
+| `log-config` | `false` | print the generated configuration to the step log |
 
 ## Outputs
 
@@ -38,7 +39,52 @@ steps.
 - run: tofu init   # uses the mirror via TOFU_CLI_CONFIG_FILE
 ```
 
-Only HTTPS mirror URLs are accepted.
+Only HTTPS mirror URLs are accepted. The scheme is matched case-insensitively,
+per RFC 3986.
+
+## What this action does to your job
+
+Both are deliberate, and both are things to know before composing this action
+with other steps:
+
+- **The exports are job-wide and cannot be undone.** `TF_CLI_CONFIG_FILE` (and
+  `TOFU_CLI_CONFIG_FILE` for `binary: tofu`) are written to `$GITHUB_ENV`, so
+  every *later* step in the job installs providers from the mirror — including
+  steps that have nothing to do with Terraform. A composite action has no `post:`
+  hook, so there is no way to restore the previous value. If one was already set,
+  the action now says so with a `::warning::` before replacing it.
+- **The config file is overwritten and then stays.** Any existing file at
+  `config-path` is replaced without a backup; if another step wrote registry
+  credentials there earlier in the job, they are gone. The file is written with
+  mode `600` and left in place for the rest of the job — do not upload or cache
+  `$RUNNER_TEMP` (or the `config-file-path` directory) as a build artifact.
+
+## Security notes
+
+**HTTPS is not content trust.** A network mirror is exactly as trustworthy as
+whoever operates it and whoever holds its TLS certificate. HashiCorp's own
+documentation is blunt about this: *"Don't configure `network_mirror` URLs that
+you do not trust… a network mirror with a TLS certificate can potentially serve
+modified copies of upstream providers with malicious content."* The
+[provider network mirror protocol](https://developer.hashicorp.com/terraform/internals/provider-network-mirror-protocol)
+has **no signature verification** — integrity rests on an optional, *mirror-supplied*
+`hashes` property, and if the mirror omits it, *"Terraform will install the
+indicated archive with no verification."* Your `.terraform.lock.hcl` hashes
+remain the primary integrity control; commit them and review changes to them.
+
+**`mirror-url` must not carry a credential.** The action rejects embedded
+userinfo (`https://user:pass@host/`) and query strings outright rather than
+escaping them, because the value is written into an HCL string. Give the mirror's
+credentials to Terraform through a `credentials` block or a `.netrc` file
+instead. Anything credential-shaped that does reach the action is passed through
+`::add-mask::` before it is validated, so a rejected URL does not leak its secret
+into the log — but a composite action cannot call `core.setSecret`, so masking
+here is best-effort by construction. This is the one place `hashicorp/setup-terraform`,
+being a JavaScript action, can do something this action cannot.
+
+The generated configuration is **not** printed to the log by default. Set
+`log-config: "true"` if you want it, bearing in mind that build logs are
+world-readable on a public repository.
 
 ## Pinning this action
 

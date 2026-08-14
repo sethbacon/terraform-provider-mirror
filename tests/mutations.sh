@@ -43,6 +43,10 @@ LINE_GUARDS=(
   config-path-containment
   config-path-filename
   config-path-regular
+  scheme-case
+  config-file-mode
+  env-overwrite-warning
+  write-diagnostic
 )
 
 mutate_line_guard() { # <guard-name> <src> <dst>
