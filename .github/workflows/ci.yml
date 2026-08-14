@@ -31,6 +31,21 @@ jobs:
           persist-credentials: false
       - name: Run the behaviour suite
         run: tests/run-tests.sh
+
+      # The charset-locale guard defends a hazard that only EXISTS in a collating
+      # locale: bash evaluates an ERE bracket range by LC_COLLATE, so [A-Za-z]
+      # admits `ä` under en_US.UTF-8 and refuses it under C and C.UTF-8. Hosted
+      # runners default to C.UTF-8, where the first CI run of this harness
+      # reported the guard INERT — which, taken at face value, argues for
+      # deleting a guard that is load bearing on every host where the hazard is
+      # real. Generate the locale so the mutation is observable here.
+      - name: Ensure a collating UTF-8 locale exists
+        run: |
+          set -euo pipefail
+          if ! locale -a | grep -qiE '^en_US\.utf-?8$'; then
+            sudo locale-gen en_US.UTF-8
+          fi
+          locale -a | grep -iE '^en_US\.utf-?8$'
       # Every guard has to be shown to be load bearing: disable it, and the rows
       # it owns must fail. A guard nobody has broken on purpose is a guard nobody
       # has tested.
