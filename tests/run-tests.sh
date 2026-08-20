@@ -621,7 +621,17 @@ bad = []
 for wf in sorted(root.glob("*.yml")):
     text = wf.read_text()
     for line in text.splitlines():
-        m = re.search(r"uses:\s*(\S+)", line)
+        # Anchor at the YAML key, and skip comment lines outright. A bare
+        # re.search matched the word anywhere on the line, so prose that merely
+        # MENTIONS `uses:` -- which the signature-replay integrity guard's
+        # comment does, several times, while explaining that it deliberately has
+        # no uses: of its own -- was read as an action reference and reported as
+        # an unpinned one ("` is not SHA-pinned"). A pin check that fires on
+        # comments is one people learn to word around, which is worse than the
+        # unpinned action it exists to catch.
+        if line.lstrip().startswith("#"):
+            continue
+        m = re.match(r"\s*(?:-\s*)?uses:\s*(\S+)", line)
         if not m or m.group(1).startswith("./"):
             continue
         ref = m.group(1)
