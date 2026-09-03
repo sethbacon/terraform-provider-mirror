@@ -1,0 +1,23 @@
+# zizmor configuration.
+#
+# An entry here is an ACCEPTED finding, not a silenced one: it names the rule,
+# the file, and why the obvious remediation is wrong. Anything NOT listed fails
+# the job, so a new finding of any kind is still caught.
+rules:
+  self-repository:
+    ignore:
+      # zizmor 1.30.0 added this audit: an in-repo `uses: ./...` should become
+      # GitHub's self-repository form, `uses: $/...`, shipped 2026-07-30. That
+      # remediation cannot be applied here. actionlint rejects `$/` outright --
+      # 'is not following the format "owner/repo/path/to/workflow.yml@ref" nor
+      # "./path/to/workflow.yml"' -- and actionlint is a required check in this
+      # repository, run by the same 4cloudguru/shared-workflows workflow-security
+      # gate that runs zizmor. The conversion was tried in
+      # 4cloudguru/shared-workflows#46: `$/` resolved correctly at runtime and
+      # actionlint failed it anyway. Support is requested in rhysd/actionlint#711,
+      # still open; actionlint's latest release is v1.7.12 from 2026-03-30.
+      #
+      # This is one required gate refusing the fix another asks for, not an
+      # unwelcome finding. Tracked in 4cloudguru/shared-workflows#45; the ignore
+      # comes out when actionlint accepts `$/`.
+      - ci.yml
